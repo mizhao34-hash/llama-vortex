@@ -291,6 +291,62 @@ static enum ggml_status ggml_backend_vortex_graph_compute(
                 continue;
             }
         }
+        else if (node->op == GGML_OP_MUL_MAT &&
+            node->src[0]->type == GGML_TYPE_Q4_0 &&
+            node->src[1]->type == GGML_TYPE_F32) {
+
+            int64_t M = node->src[0]->ne[1];
+            int64_t K = node->src[0]->ne[0];
+            int64_t N = node->src[1]->ne[1];
+
+            // dequantize Q4_0 weights to F32 first
+            int64_t n_elems = M * K;
+            float * A_f32 = (float *)malloc(n_elems * sizeof(float));
+            if (A_f32) {
+                // each block_q4_0 has 32 elements
+                const int QK4_0 = 32;
+                int64_t n_blocks = n_elems / QK4_0;
+                const uint8_t * qdata = (const uint8_t *)node->src[0]->data;
+
+                for (int64_t b = 0; b < n_blocks; b++) {
+                    // read scale (fp16 -> fp32)
+                    uint16_t d_bits;
+                    memcpy(&d_bits, qdata + b * (2 + QK4_0/2), 2);
+                    // simple fp16 to fp32 conversion
+                    uint32_t exp = (d_bits >> 10) & 0x1F;
+                    uint32_t mant = d_bits & 0x3FF;
+                    uint32_t sign = (d_bits >> 15) & 0x1;
+                    float d;
+                    if (exp == 0) {
+                        d = (sign ? -1.0f : 1.0f) * ldexpf(mant / 1024.0f, -14);
+                    } else if (exp == 31) {
+                        d = mant ? NAN : (sign ? -INFINITY : INFINITY);
+                    } else {
+                        uint32_t f32bits = (sign << 31) | ((exp + 112) << 23) | (mant << 13);
+                        memcpy(&d, &f32bits, 4);
+                    }
+
+                    const uint8_t * qs = qdata + b * (2 + QK4_0/2) + 2;
+                    for (int j = 0; j < QK4_0/2; j++) {
+                        int v0 = (qs[j] & 0x0F) - 8;
+                        int v1 = (qs[j] >> 4)  - 8;
+                        A_f32[b * QK4_0 + j*2]     = v0 * d;
+                        A_f32[b * QK4_0 + j*2 + 1] = v1 * d;
+                    }
+                }
+
+                const float * B = (const float *)node->src[1]->data;
+                float       * C = (float *)node->data;
+
+                if (vortex_matmul_rect(A_f32, B, C, (int)M, (int)N, (int)K)) {
+                    fprintf(stderr, "[Vortex] Q4_0 matmul %ldx%ldx%ld dispatched to SimX\n", M, K, N);
+                    vortex_ops++;
+                    free(A_f32);
+                    continue;
+                }
+                free(A_f32);
+            }
+        }
 
         // Fall back to CPU for everything else
         cpu_ops++;
